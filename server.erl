@@ -1,8 +1,8 @@
 -module(server).
--export([start/0, accept_clients/1, get_chat_topic/1, update_chat_topic/2, broadcast/1, broadcast/2, remove_client/1, show_clients/0, print_messages/1, loop/2]).
--record(client, {clientSocket, clientName, state, timestamp}).
+-export([start/0, accept_clients/1, get_chat_topic/1, update_chat_topic/2, broadcast/1, broadcast/2, remove_client/1, show_clients/0, print_messages/1, loop/1, make_admin/0, remove_admin/0, mute_user/0, unmute_user/0]).
+-record(client, {clientSocket, clientName, adminStatus = false, state = online, timestamp}).
 -record(message, {timestamp, senderName, text, receiver}).
--record(status, {listenSocket, counter, maxClients, historySize, chatTopic}).
+-record(server_status, {listenSocket, counter, maxClients, historySize, chatTopic}).
 -include_lib("stdlib/include/qlc.hrl").
 
 start() ->
@@ -117,16 +117,49 @@ loop(ClientSocket, ListenSocket) ->
                     loop(ClientSocket, ListenSocket);
                 % Exit from ChatRoom
                 {exit} ->
-                    io:format("Client ~p left the ChatRoom.~n",[getUserName(ClientSocket)]),
-                    LeavingMessage = getUserName(ClientSocket) ++ " left the ChatRoom.",
+                    ClientName = getUserName(ClientSocket),
+                    io:format("Client ~p left the ChatRoom.~n",[ClientName]),
+                    LeavingMessage = ClientName ++ " left the ChatRoom.",
                     broadcast({ClientSocket, LeavingMessage}),
-                    remove_client(ClientSocket)
+                    remove_client(ClientSocket);
+                {make_admin, AdminClientName} ->
+                    % io:format("make admin initiated~n"),
+                    AdminClientSocket = getSocket(AdminClientName),
+                    case AdminClientSocket of
+                        {error, _} ->
+                            % io:format("make admin case 1~n"),
+                            gen_tcp:send(ClientSocket, term_to_binary({error, "User " ++ AdminClientName ++" does not exist"}));
+                        _ ->
+                            % io:format("make admin case 2~n"),
+                            gen_tcp:send(ClientSocket, term_to_binary({success})),
+                            make_admin(AdminClientName)
+                    end,
+                    loop(ClientSocket);
+                {kick, KickClientName} ->
+                    % io:format("kick initiated~n"),
+                    KickClientSocket = getSocket(KickClientName),
+                    case KickClientSocket of
+                        {error, _} ->
+                            io:format("kick case 1~n"),
+                            gen_tcp:send(ClientSocket, term_to_binary({error, "User " ++ KickClientName ++" does not exist"}));
+                        _ ->
+                            io:format("kick case 2~n"),
+                            gen_tcp:send(ClientSocket, term_to_binary({success})),
+                            io:format("Client ~p was kicked from the chatroom.~n",[KickClientName]),
+                            KickingMessage = KickClientName ++ " was kicked from the chatroom.",
+                            broadcast({ClientSocket, KickingMessage}),
+                            remove_client(KickClientSocket)
+                    end,
+                    loop(ClientSocket);
+                _ ->
+                    io:format("Undefined message received~n")
             end;
-        % Client Connection lost
         {tcp_closed, ClientSocket} ->
+            io:format("91~n"),
             io:format("Client ~p disconnected~n", [getUserName(ClientSocket)]),
             remove_client(ClientSocket)
     end.
+    % loop(ClientSocket).
 
 insert_client_database(ClientSocket, ClientName) ->
     ClientRecord = #client{clientSocket=ClientSocket, clientName = ClientName, state=online, timestamp = os:timestamp()},
@@ -187,8 +220,15 @@ active_clients() ->
 
 getUserName(ClientSocket) ->
     Trans = fun() -> mnesia:read({client, ClientSocket}) end, 
-    {atomic,[Record]} = mnesia:transaction(Trans),
-    Record#client.clientName.
+    % {atomic,[Record]} = mnesia:transaction(Trans),
+    % Record#client.clientName.
+    Result = mnesia:transaction(Trans),
+    case Result of
+        {atomic, [Record]} ->
+            Record#client.clientName;
+        _ ->
+            {error, not_found}
+    end.
 
 getSocket(Name) ->
     Query = qlc:q([User#client.clientSocket || User <- mnesia:table(client), User#client.clientName == Name]),
@@ -196,10 +236,8 @@ getSocket(Name) ->
     case Trans of
         {atomic, [Socket]} ->
             Socket;
-        {atomic, []} ->
-            {error, not_found};
-        {aborted, Reason} ->
-            {error, Reason}
+        _ ->
+            {error, not_found}
     end.
 
 broadcast({SenderSocket, Message}, Receiver) ->
@@ -240,10 +278,8 @@ broadcast({SenderSocket, Message}) ->
     end, Keys).
 
 remove_client(ClientSocket) ->
-    ClientName = getUserName(ClientSocket),
-    ClientRecord = #client{clientSocket = ClientSocket, clientName = ClientName},
     mnesia:transaction(fun() ->
-        mnesia:delete_object(ClientRecord)
+        mnesia:delete({client, ClientSocket})
     end),
     gen_tcp:close(ClientSocket).
 
@@ -282,10 +318,8 @@ retreive_messages(N) ->
     {atomic, Query} = mnesia:transaction(F),
     ReverseMessages = lists:sublist(lists:reverse(Query), 1, N),
     Messages = lists:reverse(ReverseMessages),
-    % io:format("~p~n",[Messages]),
-    % Messages.
     Filtered = lists:filter(fun({message,_,_,_, Receiver}) ->  
-                            Receiver == "All"                        
+                            Receiver == "All"
                     end,  Messages),
     MessageHistory = lists:map(fun({message,_,SenderName,Text, _}) ->
         Msg = SenderName ++ " : " ++ Text,
@@ -297,6 +331,57 @@ print_messages(N) ->
     io:format("Messages:~n"),
     lists:foreach(fun(X) ->
         io:format("~p~n", [X]) end, Messages).
+
+make_admin() ->
+    ClientName = string:trim(io:get_line("Enter Client Name: ")),
+    make_admin(ClientName).
+
+make_admin(ClientName) ->
+    ClientSocket = getSocket(ClientName),
+    case ClientSocket of
+        {error, _Message} ->
+            io:format("No such user found~n");
+        ClientSocket ->
+            Trans = fun() ->
+                mnesia:write(#client{clientSocket = ClientSocket, clientName = ClientName, adminStatus = true}) end,
+            mnesia:transaction(Trans),
+            gen_tcp:send(ClientSocket, term_to_binary({admin, true}))
+    end.
+    
+remove_admin() ->
+    ClientName = string:trim(io:get_line("Enter Client Name: ")),
+    ClientSocket = getSocket(ClientName),
+    case ClientSocket of
+        {error, _Message} ->
+            io:format("No such user found~n");
+        ClientSocket ->
+            Trans = fun() -> mnesia:write(#client{clientSocket = ClientSocket, clientName = ClientName, adminStatus = false}) end,
+            mnesia:transaction(Trans),
+            gen_tcp:send(ClientSocket, term_to_binary({admin, false}))
+    end.
+
+mute_user() ->
+    ClientName = string:trim(io:get_line("Enter Client Name: ")),
+    {MuteDuration, []} = string:to_integer(string:trim(io:get_line("Mute Duration (in minutes): "))),
+    ClientSocket = getSocket(ClientName),
+    case ClientSocket of
+        {error, _Message} ->
+            io:format("No such user found~n");
+        ClientSocket ->
+            gen_tcp:send(ClientSocket, term_to_binary({mute, true, MuteDuration}))
+    end.
+
+unmute_user() ->
+    ClientName = string:trim(io:get_line("Enter Client Name: ")),
+    ClientSocket = getSocket(ClientName),
+    case ClientSocket of
+        {error, _Message} ->
+            io:format("No such user found~n");
+        ClientSocket ->
+            gen_tcp:send(ClientSocket, term_to_binary({mute, false, 0}))
+    end.
+
+
 
 % -----------------------------------------
 
