@@ -1,30 +1,35 @@
 -module(server).
--export([start/0, accept_clients/1, broadcast/1, broadcast/2, remove_client/1, show_clients/0, print_messages/1, loop/1]).
--record(client, {clientSocket, clientName}).
--record(message, {timestamp, senderName, text}).
--record(server_status, {listenSocket, counter, maxClients, historySize}).
+-export([start/0, accept_clients/1, get_chat_topic/1, update_chat_topic/2, broadcast/1, broadcast/2, remove_client/1, show_clients/0, print_messages/1, loop/2]).
+-record(client, {clientSocket, clientName, state, timestamp}).
+-record(message, {timestamp, senderName, text, receiver}).
+-record(status, {listenSocket, counter, maxClients, historySize, chatTopic}).
 -include_lib("stdlib/include/qlc.hrl").
 
 start() ->
     init_databases(),
     {N,[]} =  string:to_integer(string:trim(io:get_line("Enter No of Clients Allowed : "))),
     {X,[]} =  string:to_integer(string:trim(io:get_line("Message History Size : "))),
-    {ok, ListenSocket} = gen_tcp:listen(9991, [binary, {packet, 0}, {active, true}]),
-    io:format("Server listening on port 9991 and Socket : ~p ~n",[ListenSocket]),
+    ChatTopic = string:trim(io:get_line("Enter Chat Topic : ")),
+    {ok, ListenSocket} = gen_tcp:listen(9990, [binary, {packet, 0}, {active, true}]),
+    io:format("Server listening on port 9990 and Socket : ~p ~n",[ListenSocket]),
     Counter = 1,
-    ServerStatus = #server_status{listenSocket = ListenSocket, counter = Counter, maxClients = N, historySize = X},
-    spawn(server, accept_clients, [ServerStatus]).
+    ServerRecord = #status{listenSocket = ListenSocket, counter = Counter, maxClients = N, historySize = X, chatTopic = ChatTopic},
+    mnesia:transaction(fun() ->
+        mnesia:write(ServerRecord) end),
+    spawn(server, accept_clients, [ListenSocket]).
 
 init_databases() ->
     mnesia:start(),
     mnesia:create_table(client, [{attributes, record_info(fields, client)}]),
-    mnesia:create_table(message, [{attributes, record_info(fields, message)}, {type, ordered_set}]).
+    mnesia:create_table(message, [{attributes, record_info(fields, message)}, {type, ordered_set}]),
+    mnesia:create_table(status, [{attributes, record_info(fields, status)}]).
 
-accept_clients(ServerStatus) ->
-    ListenSocket = ServerStatus#server_status.listenSocket,
-    MaxClients = ServerStatus#server_status.maxClients,
-    HistorySize = ServerStatus#server_status.historySize,
-    Counter = ServerStatus#server_status.counter,
+accept_clients(ListenSocket) ->
+    {atomic,[Row]} = mnesia:transaction(fun() ->mnesia:read(status, ListenSocket) end),
+    MaxClients = Row#status.maxClients,
+    HistorySize = Row#status.historySize,
+    Counter = Row#status.counter,
+    ChatTopic = Row#status.chatTopic,
     {ok, ClientSocket} = gen_tcp:accept(ListenSocket),
     Active_clients = active_clients(),
     if 
@@ -32,25 +37,27 @@ accept_clients(ServerStatus) ->
             ClientName = "User" ++ integer_to_list(Counter),
             io:format("Accepted connection from ~p~n", [ClientName]),
             MessageHistory = retreive_messages(HistorySize),
-            Data = {connected, ClientName, MessageHistory},
+            Data = {connected, ClientName, MessageHistory, ChatTopic},
             BinaryData = erlang:term_to_binary(Data),
             gen_tcp:send(ClientSocket, BinaryData),
             insert_client_database(ClientSocket, ClientName),
             Message = ClientName ++ " joined the ChatRoom.",
             broadcast({ClientSocket, Message}),
             NewCounter = Counter + 1,
-            ServerStatus1 = ServerStatus#server_status{counter = NewCounter},
-            ListenPid = spawn(server, loop, [ClientSocket]),
+            {atomic, [Record]} = mnesia:transaction(fun() -> mnesia:read({status, ListenSocket}) end),
+            UpdatedRecord = Record#status{counter = NewCounter},
+            mnesia:transaction(fun()->mnesia:write(UpdatedRecord) end),
+            ListenPid = spawn(server, loop, [ClientSocket, ListenSocket]),
             gen_tcp:controlling_process(ClientSocket, ListenPid),
-            accept_clients(ServerStatus1);
+            accept_clients(ListenSocket);
         true->
             Message = "No Space on Server :(",
             gen_tcp:send(ClientSocket, term_to_binary({reject,Message})),
             gen_tcp:close(ClientSocket),
-            accept_clients(ServerStatus)
+            accept_clients(ListenSocket)
     end.
 
-loop(ClientSocket) ->
+loop(ClientSocket, ListenSocket) ->
     gen_tcp:recv(ClientSocket, 0),
     receive
         {tcp, ClientSocket, BinaryData} ->
@@ -58,19 +65,56 @@ loop(ClientSocket) ->
             case Data of
                 % Private Message
                 {private_message, Message, Receiver} ->
-                    io:format("Client ~p send message to ~p : ~p~n", [getUserName(ClientSocket), Receiver, Message]),
-                    broadcast({ClientSocket, Message}, Receiver),
-                    loop(ClientSocket);
+                    RecSocket = getSocket(Receiver),
+                    RecvState = get_state(RecSocket),
+                    if 
+                        RecvState =:= online ->
+                            io:format("Client ~p send message to ~p : ~p~n", [getUserName(ClientSocket), Receiver, Message]),
+                            broadcast({ClientSocket, Message}, Receiver);
+                        true ->
+                            SenderName = getUserName(ClientSocket),
+                            Msg = "Receiver is Oflline, he will be notified later.",
+                            insert_message_database(SenderName, Message, Receiver),
+                            io:format("~s~n",[Msg]),
+                            gen_tcp:send(ClientSocket, term_to_binary({warning, Msg}))
+                    end,
+                    loop(ClientSocket, ListenSocket);
                 % Broadcast Message
                 {message, Message} ->
                     io:format("Received from ~p: ~s~n",[getUserName(ClientSocket),Message]),
                     broadcast({ClientSocket,Message}),
-                    loop(ClientSocket); 
+                    loop(ClientSocket, ListenSocket); 
                 % Send list of Active Clients 
                 {show_clients} ->
                     List = retreive_clients(),
                     gen_tcp:send(ClientSocket, term_to_binary({List})),
-                    loop(ClientSocket);
+                    loop(ClientSocket, ListenSocket);
+                % Client going offline
+                {offline} ->
+                    Message = getUserName(ClientSocket) ++ " is offline now.",
+                    update_state(ClientSocket, offline),
+                    broadcast({ClientSocket, Message}),
+                    loop(ClientSocket, ListenSocket);
+                % Client going online
+                {online} ->
+                    Message = getUserName(ClientSocket) ++ " is online now.",
+                    Last_Active = update_state(ClientSocket, online),
+                    broadcast({ClientSocket, Message}),
+                    Prev_messages = get_old_messages(ClientSocket, Last_Active),
+                    gen_tcp:send(ClientSocket, term_to_binary({previous, Prev_messages})),
+                    loop(ClientSocket, ListenSocket);
+                % Get Chat Topic
+                {topic} ->
+                    Topic = get_chat_topic(ListenSocket),
+                    gen_tcp:send(ClientSocket, term_to_binary({topic, Topic})),
+                    loop(ClientSocket, ListenSocket);
+                %Change Chat Topic
+                {change_topic, NewTopic} ->
+                    update_chat_topic(NewTopic, ListenSocket),
+                    gen_tcp:send(ClientSocket, term_to_binary({success})),
+                    Message = "Chat Topic Updated to " ++ NewTopic,
+                    broadcast({ClientSocket, Message}),
+                    loop(ClientSocket, ListenSocket);
                 % Exit from ChatRoom
                 {exit} ->
                     io:format("Client ~p left the ChatRoom.~n",[getUserName(ClientSocket)]),
@@ -85,16 +129,55 @@ loop(ClientSocket) ->
     end.
 
 insert_client_database(ClientSocket, ClientName) ->
-    ClientRecord = #client{clientSocket=ClientSocket, clientName = ClientName},
+    ClientRecord = #client{clientSocket=ClientSocket, clientName = ClientName, state=online, timestamp = os:timestamp()},
     mnesia:transaction(fun() ->
         mnesia:write(ClientRecord)
     end).
 
-insert_message_database(ClientName, Message) ->
-        MessageRecord = #message{timestamp = os:timestamp(), senderName = ClientName, text = Message},
+insert_message_database(ClientName, Message, Receiver) ->
+        MessageRecord = #message{timestamp = os:timestamp(), senderName = ClientName, text = Message, receiver = Receiver},
         mnesia:transaction(fun() ->
             mnesia:write(MessageRecord)
         end).
+
+compare_timestamps({Seconds1, Microseconds1, _}, {Seconds2, Microseconds2, _}) ->
+    if
+        Seconds1 < Seconds2 ->
+            less;
+        Seconds1 > Seconds2 ->
+            greater;
+        Microseconds1 < Microseconds2 ->
+            less;
+        Microseconds1 > Microseconds2 ->
+            greater;
+        true ->
+            equal
+    end.
+        
+
+get_old_messages(ClientSocket, Last_Active) ->
+    F = fun() ->
+        qlc:e(qlc:q([M || M <- mnesia:table(message)]))
+    end,
+    {atomic, Query} = mnesia:transaction(F),
+    ReceiverName = getUserName(ClientSocket),
+    Filtered = lists:filter(
+        fun({message,Timestamp,_,_,Receiver}) ->
+                (Receiver == ReceiverName orelse Receiver=="All") andalso compare_timestamps(Timestamp, Last_Active) =:= greater 
+            end, Query),
+    Final = lists:map(
+            fun({message,_, SenderName, Text, _}) ->
+                Msg = SenderName ++ " : " ++ Text,
+                Msg
+            end, Filtered),
+    Final.
+
+update_state(ClientSocket, State) ->
+    Trans = fun() -> mnesia:read({client, ClientSocket}) end,
+    {atomic, [Row]} = mnesia:transaction(Trans),
+    UpdatedRecord = Row#client{state = State, timestamp = os:timestamp()},
+    mnesia:transaction(fun() -> mnesia:write(UpdatedRecord) end),
+    Row#client.timestamp.
 
 active_clients() ->
     Trans = fun() -> mnesia:all_keys(client) end,
@@ -123,32 +206,38 @@ broadcast({SenderSocket, Message}, Receiver) ->
     % private messages don't get saved in the database
     RecSocket = getSocket(Receiver),
     SenderName = getUserName(SenderSocket),
+    insert_message_database(SenderName, Message, Receiver),
     case RecSocket of
         {error, not_found} ->
             gen_tcp:send(SenderSocket, term_to_binary({error, "User not found"}));
-        RecvSocket ->
-            io:format("RecScoket : ~p, Sendername : ~p~n",[RecvSocket, SenderName]),
-            gen_tcp:send(RecvSocket, term_to_binary({message, SenderName, Message})),
-            gen_tcp:send(SenderSocket, {success, "Message Succesfully Sent"})
+        RecSocket ->
+            io:format("RecScoket : ~p, Sendername : ~p~n",[RecSocket, SenderName]),
+            gen_tcp:send(RecSocket, term_to_binary({message, SenderName, Message})),
+            gen_tcp:send(SenderSocket, term_to_binary({success, "Message Succesfully Sent"}))
     end.
 
 broadcast({SenderSocket, Message}) ->
     SenderName = getUserName(SenderSocket),
-    insert_message_database(SenderName, Message),
+    insert_message_database(SenderName, Message, "All"),
     Keys = mnesia:dirty_all_keys(client),
     lists:foreach(fun(ClientSocket) ->
-        case ClientSocket/=SenderSocket of
-            true ->
-                case mnesia:dirty_read({client, ClientSocket}) of
-                [_] ->
-                    io:format("Broadcasted the Message~n"),
-                    gen_tcp:send(ClientSocket, term_to_binary({message, SenderName, Message}));
-                [] ->
-                    io:format("No receiver Found ~n") 
+        State = get_state(ClientSocket),
+        case State of
+            online ->
+                case ClientSocket/=SenderSocket of
+                    true ->
+                        case mnesia:dirty_read({client, ClientSocket}) of
+                        [_] ->
+                            io:format("Broadcasted the Message~n"),
+                            gen_tcp:send(ClientSocket, term_to_binary({message, SenderName, Message}));
+                        [] ->
+                            io:format("No receiver Found ~n") 
+                        end;
+                    false -> ok
                 end;
-            false -> ok
-            end
-        end, Keys).
+            _ -> ok
+        end
+    end, Keys).
 
 remove_client(ClientSocket) ->
     ClientName = getUserName(ClientSocket),
@@ -157,6 +246,21 @@ remove_client(ClientSocket) ->
         mnesia:delete_object(ClientRecord)
     end),
     gen_tcp:close(ClientSocket).
+
+get_state(ClientSocket) ->
+    Trans = fun() -> mnesia:read({client, ClientSocket}) end,
+    {atomic,[Row]} = mnesia:transaction(Trans),
+    Row#client.state.
+
+get_chat_topic(ListenSocket) ->
+        Trans = fun() -> mnesia:read({status, ListenSocket}) end,
+    {atomic, [Row]} = mnesia:transaction(Trans),
+    Row#status.chatTopic.
+
+update_chat_topic(NewTopic, ListenSocket) ->
+    {atomic, [Row]} = mnesia:transaction(fun() -> mnesia:read({status, ListenSocket}) end),
+    UpdatedRecord = Row#status{chatTopic = NewTopic},
+    mnesia:transaction(fun()->mnesia:write(UpdatedRecord) end).
 
 show_clients() ->
     ClientList = retreive_clients(),
@@ -180,11 +284,12 @@ retreive_messages(N) ->
     Messages = lists:reverse(ReverseMessages),
     % io:format("~p~n",[Messages]),
     % Messages.
-    MessageHistory = lists:map(fun(X) ->  
-                        {message,_,SenderName,Text} = X,
-                        MsgString = SenderName ++  " : " ++ Text,
-                        MsgString
+    Filtered = lists:filter(fun({message,_,_,_, Receiver}) ->  
+                            Receiver == "All"                        
                     end,  Messages),
+    MessageHistory = lists:map(fun({message,_,SenderName,Text, _}) ->
+        Msg = SenderName ++ " : " ++ Text,
+        Msg end, Filtered),
     MessageHistory.
 
 print_messages(N) ->
